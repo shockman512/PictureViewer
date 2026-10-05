@@ -4,3 +4,6 @@ __pycache__/
 *.spec
 *.exe
 picviewer_build.py
+models/
+PictureViewer_App/
+PictureViewer_App_new/

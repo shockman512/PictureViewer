@@ -5,13 +5,16 @@ import random
 import subprocess
 import sys
 import threading
+
+import numpy as np
 from collections import OrderedDict
 
 from PySide6.QtCore import (QAbstractListModel, QModelIndex, QObject, QRunnable, QSize, Qt,
-                            QSettings, QThread, QThreadPool, QTimer, Signal)
+                            QPoint, QRectF, QSettings, QThread, QThreadPool, QTimer, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QIcon, QImage, QPalette, QImageReader, QKeySequence,
-                           QPainter, QPixmap, QTransform)
-from PySide6.QtWidgets import (QApplication, QFileDialog, QGraphicsPixmapItem, QGraphicsScene,
+                           QBrush, QPainter, QPen, QPixmap, QTransform)
+from PySide6.QtWidgets import (QApplication, QGraphicsRectItem, QGraphicsSimpleTextItem,
+                               QInputDialog, QMenu, QFileDialog, QGraphicsPixmapItem, QGraphicsScene,
                                QGraphicsView, QLabel, QMainWindow,
                                QMessageBox, QSplitter, QToolBar, QListView)
 
@@ -24,6 +27,13 @@ try:
     import rawpy
 except ImportError:
     rawpy = None
+try:
+    import faces as fc
+    from facesui import PeopleDialog
+    if not fc.available():
+        fc = None
+except Exception:  # OpenCV or models missing: the viewer still works without face support
+    fc = None
 try:
     from send2trash import send2trash
 except ImportError:
@@ -184,6 +194,60 @@ class _ThumbWorker(QRunnable):
             ld.signals.thumb.emit(path, img, False)
 
 
+def load_for_faces(path):
+    """BGR numpy array (EXIF-rotated, downscaled for speed) or None."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in QT_EXTS:
+        r = QImageReader(path)
+        r.setAutoTransform(True)
+        sz = r.size()
+        if sz.isValid() and max(sz.width(), sz.height()) > fc.MAX_SIDE:
+            r.setScaledSize(sz.scaled(fc.MAX_SIDE, fc.MAX_SIDE, Qt.KeepAspectRatio))
+        img = r.read()
+    else:
+        img = load_image(path, max_size=fc.MAX_SIDE)
+    if img.isNull():
+        return None
+    img = img.convertToFormat(QImage.Format_RGB888)
+    w, h, bpl = img.width(), img.height(), img.bytesPerLine()
+    arr = np.frombuffer(img.constBits(), np.uint8).reshape(h, bpl)[:, :w * 3].reshape(h, w, 3)
+    return np.ascontiguousarray(arr[:, :, ::-1])  # RGB -> BGR
+
+
+class FaceSignals(QObject):
+    progress = Signal(int, int)
+    finished = Signal(bool)   # cancelled?
+
+
+class FaceScanJob(QRunnable):
+    def __init__(self, paths, store, signals):
+        super().__init__()
+        self.paths, self.store, self.signals = paths, store, signals
+        self.cancelled = False
+
+    def run(self):
+        try:
+            engine = fc.FaceEngine()
+            total = len(self.paths)
+            for i, p in enumerate(self.paths, 1):
+                if self.cancelled:
+                    break
+                try:
+                    st = os.stat(p)
+                    key = (int(st.st_mtime), st.st_size)
+                    if not self.store.is_current(p, *key):
+                        bgr = load_for_faces(p)
+                        found = engine.analyze(bgr) if bgr is not None else []
+                        self.store.save(p, *key, found)
+                except Exception:
+                    pass
+                if i % 3 == 0 or i == total:
+                    self.signals.progress.emit(i, total)
+            self.store.regroup()
+        finally:
+            self.signals.finished.emit(self.cancelled)
+
+
 class ImageJob(QRunnable):
     def __init__(self, path, state, signals, prefetch=False):
         super().__init__()
@@ -246,6 +310,8 @@ class ThumbModel(QAbstractListModel):
 
 class ImageView(QGraphicsView):
     zoomChanged = Signal(float)
+    faceClicked = Signal(int)
+    faceMenu = Signal(int, QPoint)
 
     def __init__(self):
         super().__init__()
@@ -259,8 +325,62 @@ class ImageView(QGraphicsView):
         self.setBackgroundBrush(Qt.black)
         self.setFrameShape(QGraphicsView.NoFrame)
         self.fit_mode = True
+        self.face_items = []
+        self._press = None
+
+    def set_faces(self, faces):
+        """faces: dicts with fractional x,y,w,h plus id, label, color. Drawn on top of the picture."""
+        self.clear_faces()
+        pm = self.item.pixmap()
+        if pm.isNull():
+            return
+        W, H = pm.width(), pm.height()
+        for f in faces:
+            r = QGraphicsRectItem(QRectF(f["x"] * W, f["y"] * H, f["w"] * W, f["h"] * H), self.item)
+            pen = QPen(QColor(f["color"]), 2)
+            pen.setCosmetic(True)
+            r.setPen(pen)
+            r.setData(0, f["id"])
+            self.face_items.append(r)
+            if f["label"]:
+                t = QGraphicsSimpleTextItem(f["label"], r)
+                t.setBrush(QBrush(QColor(f["color"])))
+                t.setFlag(t.GraphicsItemFlag.ItemIgnoresTransformations)
+                t.setPos(f["x"] * W, (f["y"] + f["h"]) * H)
+                t.setData(0, f["id"])
+
+    def clear_faces(self):
+        for r in self.face_items:
+            if r.scene() is not None:
+                self.scene().removeItem(r)
+        self.face_items = []
+
+    def face_at(self, pos):
+        for it in self.items(pos):
+            fid = it.data(0)
+            if fid is not None:
+                return fid
+        return None
+
+    def mousePressEvent(self, e):
+        self._press = e.position().toPoint()
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        super().mouseReleaseEvent(e)
+        if (self._press is not None and e.button() == Qt.LeftButton
+                and (e.position().toPoint() - self._press).manhattanLength() < 4):
+            fid = self.face_at(e.position().toPoint())
+            if fid is not None:
+                self.faceClicked.emit(fid)
+
+    def contextMenuEvent(self, e):
+        fid = self.face_at(e.pos())
+        if fid is not None:
+            self.faceMenu.emit(fid, e.globalPos())
 
     def set_image(self, pix, keep_zoom=False):
+        self.clear_faces()
         self.item.setPixmap(pix)
         self.scene().setSceneRect(self.item.boundingRect())
         if not keep_zoom:
@@ -321,6 +441,7 @@ class Viewer(QMainWindow):
         self.resize(1200, 800)
         self.setAcceptDrops(True)
         self.folder = None
+        self.search_title = None
         self.files = []
         self.index = -1
         self.image_pool = QThreadPool()  # separate so the main picture never waits on thumbnails
@@ -430,6 +551,154 @@ class Viewer(QMainWindow):
         self.toolbar = tb
 
         self.build_slideshow_menu()
+        self.build_people_menu()
+
+    # ---- Faces ----
+    def build_people_menu(self):
+        self.store = fc.FaceStore() if fc else None
+        self.face_job = None
+        self.face_signals = None
+        menu = self.menuBar().addMenu("&People")
+        if not self.store:
+            menu.addAction("Face recognition unavailable (OpenCV or models missing)").setEnabled(False)
+            self.boxes_a = QAction(self)
+            return
+        self.face_signals = FaceSignals()
+        self.face_signals.progress.connect(lambda i, n: self.status.showMessage(
+            f"Scanning faces… {i} / {n}"))
+        self.face_signals.finished.connect(self.on_scan_finished)
+        self.face_pool = QThreadPool()
+        self.face_pool.setMaxThreadCount(1)
+        self.face_pool.setThreadPriority(QThread.LowPriority)
+        self.scan_a = menu.addAction("&Scan this folder for faces", self.scan_faces)
+        self.cancel_a = menu.addAction("Cancel scan", self.cancel_scan)
+        self.cancel_a.setEnabled(False)
+        menu.addSeparator()
+        self.boxes_a = QAction("Show face &boxes", self, checkable=True)
+        self.boxes_a.setShortcut(QKeySequence("F2"))
+        self.boxes_a.toggled.connect(lambda _: self.refresh_faces())
+        menu.addAction(self.boxes_a)
+        menu.addAction("&People…", self.show_people)
+        menu.addAction("&Find person…", self.find_person)
+        self.back_a = menu.addAction("&Back to folder", self.back_to_folder)
+        self.back_a.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("&Delete all face data…", self.clear_faces_data)
+        self.view.faceClicked.connect(self.name_face_dialog)
+        self.view.faceMenu.connect(self.face_context_menu)
+
+    def scan_faces(self):
+        if not self.files or self.face_job:
+            return
+        self.face_job = FaceScanJob(list(self.files), self.store, self.face_signals)
+        self.face_job.setAutoDelete(False)
+        self.scan_a.setEnabled(False)
+        self.cancel_a.setEnabled(True)
+        self.face_pool.start(self.face_job)
+
+    def cancel_scan(self):
+        if self.face_job:
+            self.face_job.cancelled = True
+
+    def on_scan_finished(self, cancelled):
+        self.face_job = None
+        self.scan_a.setEnabled(True)
+        self.cancel_a.setEnabled(False)
+        n_photos, n_faces, _ = self.store.stats()
+        self.status.showMessage(("Scan cancelled. " if cancelled else "Scan complete. ")
+                                + f"{n_faces} faces in {n_photos} photos.")
+        self.refresh_faces()
+
+    def refresh_faces(self):
+        """Redraw the name boxes for the picture on screen."""
+        if not self.store or not self.boxes_a.isChecked() or not self.shown_path:
+            self.view.clear_faces()
+            return
+        boxes = []
+        for f in self.store.faces_in(self.shown_path):
+            if f["name"]:
+                label, color = f["name"], "#41d36b"
+            elif f["suggest"]:
+                label, color = f"{f['suggest'][1]}?", "#ffb02e"
+            else:
+                label, color = "", "#ffffff"
+            boxes.append(dict(id=f["id"], x=f["x"], y=f["y"], w=f["w"], h=f["h"],
+                              label=label, color=color))
+        self.view.set_faces(boxes)
+
+    def faces_changed(self):
+        self.refresh_faces()
+
+    def _face(self, face_id):
+        return next((f for f in self.store.faces_in(self.shown_path) if f["id"] == face_id), None)
+
+    def name_face_dialog(self, face_id):
+        f = self._face(face_id)
+        if not f:
+            return
+        names = self.store.names()
+        default = f["name"] or (f["suggest"][1] if f["suggest"] else "")
+        name, ok = QInputDialog.getItem(self, "Who is this?", "Name:", names,
+                                        names.index(default) if default in names else 0, True)
+        if ok and name.strip():
+            self.store.name_face(face_id, name)
+            self.store.regroup()
+            self.refresh_faces()
+
+    def face_context_menu(self, face_id, pos):
+        f = self._face(face_id)
+        if not f:
+            return
+        m = QMenu(self)
+        m.addAction("Name this face…", lambda: self.name_face_dialog(face_id))
+        if f["suggest"] and not f["name"]:
+            n = f["suggest"][1]
+            m.addAction(f"Yes, this is {n}", lambda: (self.store.name_face(face_id, n),
+                                                       self.refresh_faces()))
+        if f["name"]:
+            m.addAction("Remove name", lambda: (self.store.unname_face(face_id), self.refresh_faces()))
+        m.addAction("Not a face", lambda: (self.store.ignore_face(face_id), self.refresh_faces()))
+        m.addSeparator()
+        m.addAction("Find more photos of this person",
+                    lambda: self.show_results(self.store.paths_like(f["emb"]), "similar faces"))
+        m.exec(pos)
+
+    def show_people(self):
+        if self.face_job:
+            self.status.showMessage("A scan is running; the list will be incomplete until it finishes.")
+        self.store.regroup()
+        PeopleDialog(self.store, self).exec()
+
+    def find_person(self):
+        names = self.store.names()
+        if not names:
+            QMessageBox.information(self, "Find person", "No one is named yet. Scan a folder, "
+                                    "then name faces with People… or by clicking a face box.")
+            return
+        name, ok = QInputDialog.getItem(self, "Find person", "Name:", names, 0, True)
+        if ok and name.strip():
+            self.show_results(self.store.paths_for_name(name.strip()), name.strip())
+
+    def show_results(self, paths, title):
+        paths = [p for p in paths if os.path.isfile(p)]
+        if not paths:
+            QMessageBox.information(self, "Search", f"No photos found for {title}.")
+            return
+        self.search_title = f"Search: {title}"
+        self.set_file_list(paths)
+
+    def back_to_folder(self):
+        if self.folder:
+            self.open_path(self.folder, select=self.current_path())
+
+    def clear_faces_data(self):
+        if QMessageBox.question(self, "Delete face data",
+                                "Delete all saved faces, groups and names? Photos are not touched."
+                                ) == QMessageBox.Yes:
+            self.cancel_scan()
+            self.store.clear_all()
+            self.refresh_faces()
+            self.status.showMessage("Face data deleted.")
 
     def build_slideshow_menu(self):
         cfg = QSettings("PictureViewer", "PictureViewer")
@@ -528,17 +797,23 @@ class Viewer(QMainWindow):
         if not os.path.isdir(path):
             return
         self.folder = path
+        self.search_title = None
+        self.set_file_list(self.scan(path), select, f"No pictures in {path}")
+
+    def set_file_list(self, files, select=None, empty_msg="Nothing to show"):
         self.img_cache.clear()
         self.shown_path = None
         self.loader.clear()
         self.shuffle_bag = []
-        self.files = self.scan(path)
+        self.files = files
         self.model.set_files(self.files)
+        if hasattr(self, "back_a"):
+            self.back_a.setEnabled(bool(self.search_title))
         if not self.files:
             self.index = -1
             self.view.set_image(QPixmap())
             self.setWindowTitle("Picture Viewer")
-            self.status.showMessage(f"No pictures in {path}")
+            self.status.showMessage(empty_msg)
             return
         start = self.files.index(select) if select in self.files else 0
         self.strip.setCurrentIndex(self.model.index(start))
@@ -581,8 +856,10 @@ class Viewer(QMainWindow):
             self.status.showMessage(f"Can't open {os.path.basename(path)}")
             return
         self.view.set_image(QPixmap.fromImage(img), keep_zoom=not self.view.fit_mode)
+        tag = f"   [{self.search_title}]" if self.search_title else ""
         self.status.showMessage(f"{os.path.basename(path)}   {img.width()}×{img.height()}   "
-                                f"{self.index + 1} / {len(self.files)}")
+                                f"{self.index + 1} / {len(self.files)}{tag}")
+        self.refresh_faces()
 
     def prefetch(self, i):
         for j in (i + 1, i - 1, i + 2):
@@ -648,7 +925,7 @@ class Viewer(QMainWindow):
         if pm.isNull():
             return
         self.view.set_image(pm.transformed(QTransform().rotate(deg), Qt.SmoothTransformation),
-                            keep_zoom=not self.view.fit_mode)
+                            keep_zoom=not self.view.fit_mode)  # boxes no longer line up: cleared
 
     def delete_current(self):
         p = self.current_path()
