@@ -1,0 +1,6 @@
+dist/
+build/
+__pycache__/
+*.spec
+*.exe
+picviewer_build.py
